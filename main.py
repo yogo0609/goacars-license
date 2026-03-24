@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Header, HTTPException
 import sqlite3
 import os
+import secrets
+import string
 
 app = FastAPI()
 
@@ -37,6 +39,16 @@ def require_admin_key(x_admin_key: str | None):
 
     if x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="forbidden")
+
+
+def generate_license_key():
+    alphabet = string.ascii_uppercase + string.digits
+    parts = [
+        "".join(secrets.choice(alphabet) for _ in range(4)),
+        "".join(secrets.choice(alphabet) for _ in range(4)),
+        "".join(secrets.choice(alphabet) for _ in range(4)),
+    ]
+    return "GOACARS-" + "-".join(parts)
 
 
 @app.on_event("startup")
@@ -131,3 +143,28 @@ def create_key(
         "license_key": key,
         "status": status
     }
+
+
+@app.post("/admin/generate_key")
+def admin_generate_key(x_admin_key: str | None = Header(default=None)):
+    require_admin_key(x_admin_key)
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    while True:
+        key = generate_license_key()
+        try:
+            cursor.execute(
+                "INSERT INTO licenses (license_key, status, device_id) VALUES (?, 'active', NULL)",
+                (key,)
+            )
+            conn.commit()
+            conn.close()
+            return {
+                "created": True,
+                "license_key": key,
+                "status": "active"
+            }
+        except sqlite3.IntegrityError:
+            continue
