@@ -1,10 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 import sqlite3
 import os
 
 app = FastAPI()
 
 DB_PATH = os.getenv("DB_PATH", "license.db")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 
 def get_db():
@@ -28,6 +29,14 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def require_admin_key(x_admin_key: str | None):
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=500, detail="admin_key_not_configured")
+
+    if x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
 
 
 @app.on_event("startup")
@@ -96,7 +105,13 @@ def validate_key(key: str, device_id: str):
 
 
 @app.post("/admin/create_key")
-def create_key(key: str, status: str = "active"):
+def create_key(
+    key: str,
+    status: str = "active",
+    x_admin_key: str | None = Header(default=None)
+):
+    require_admin_key(x_admin_key)
+
     conn = get_db()
     cursor = conn.cursor()
 
