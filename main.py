@@ -168,3 +168,29 @@ def admin_generate_key(x_admin_key: str | None = Header(default=None)):
             }
         except sqlite3.IntegrityError:
             continue
+
+
+@app.post("/admin/revoke_key")
+def revoke_key(key: str, x_admin_key: str | None = Header(default=None)):
+    require_admin_key(x_admin_key)
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE licenses SET status = 'revoked' WHERE license_key = ?",
+        (key,)
+    )
+
+    if cursor.rowcount == 0:
+        conn.close()
+        return {"revoked": False, "reason": "not_found"}
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "revoked": True,
+        "license_key": key,
+        "status": "revoked"
+    }
