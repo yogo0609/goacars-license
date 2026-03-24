@@ -194,3 +194,52 @@ def revoke_key(key: str, x_admin_key: str | None = Header(default=None)):
         "license_key": key,
         "status": "revoked"
     }
+
+
+@app.post("/admin/reset_device")
+def reset_device(key: str, x_admin_key: str | None = Header(default=None)):
+    require_admin_key(x_admin_key)
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE licenses SET device_id = NULL WHERE license_key = ?",
+        (key,)
+    )
+
+    if cursor.rowcount == 0:
+        conn.close()
+        return {"reset": False, "reason": "not_found"}
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "reset": True,
+        "license_key": key,
+        "device_bound": False
+    }
+
+
+@app.get("/admin/licenses")
+def list_licenses(x_admin_key: str | None = Header(default=None)):
+    require_admin_key(x_admin_key)
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id, license_key, status, device_id FROM licenses ORDER BY id DESC")
+    rows = cursor.fetchall()
+
+    conn.close()
+
+    return [
+        {
+            "id": row["id"],
+            "license_key": row["license_key"],
+            "status": row["status"],
+            "device_bound": row["device_id"] is not None
+        }
+        for row in rows
+    ]
