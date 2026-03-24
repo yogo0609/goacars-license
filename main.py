@@ -93,3 +93,26 @@ def validate_key(key: str, device_id: str):
         "status": "active",
         "device_bound": False
     }
+
+
+@app.post("/admin/create_key")
+def create_key(key: str, status: str = "active"):
+    conn = get_db()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "INSERT INTO licenses (license_key, status, device_id) VALUES (?, ?, NULL)",
+            (key, status)
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return {"created": False, "reason": "duplicate_key"}
+
+    conn.close()
+    return {
+        "created": True,
+        "license_key": key,
+        "status": status
+    }
