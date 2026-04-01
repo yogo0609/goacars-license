@@ -3,6 +3,7 @@ import sqlite3
 import os
 import secrets
 import string
+from urllib.parse import urlparse
 
 app = FastAPI()
 
@@ -16,6 +17,23 @@ def get_db():
     return conn
 
 
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+
+    url = url.strip()
+    parsed = urlparse(url)
+
+    scheme = (parsed.scheme or "").lower()
+    netloc = (parsed.netloc or "").lower()
+    path = (parsed.path or "").rstrip("/")
+
+    if not scheme or not netloc:
+        return ""
+
+    return f"{scheme}://{netloc}{path}"
+
+
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
@@ -25,9 +43,15 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT UNIQUE,
             status TEXT NOT NULL,
-            device_id TEXT
+            device_id TEXT,
+            licensed_url TEXT
         )
     """)
+
+    try:
+        cursor.execute("ALTER TABLE licenses ADD COLUMN licensed_url TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
@@ -62,11 +86,22 @@ def root():
 
 
 @app.post("/validate")
-def validate_key(key: str, device_id: str):
+def validate_key(
+    key: str | None = None,
+    device_id: str | None = None,
+    license_key: str | None = None,
+    airline_url: str | None = None
+):
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+    resolved_key = (key or license_key or "").strip()
+
+    if not resolved_key:
+        conn.close()
+        return {"valid": False, "status": "missing_key"}
+
+    cursor.execute("SELECT * FROM licenses WHERE license_key = ?", (resolved_key,))
     row = cursor.fetchone()
 
     if row is None:
@@ -75,6 +110,7 @@ def validate_key(key: str, device_id: str):
 
     status = row["status"]
     saved_device_id = row["device_id"]
+    saved_url = row["licensed_url"]
 
     if status != "active":
         conn.close()
@@ -84,53 +120,104 @@ def validate_key(key: str, device_id: str):
             "status": status
         }
 
-    if not saved_device_id:
-        cursor.execute(
-            "UPDATE licenses SET device_id = ? WHERE license_key = ?",
-            (device_id, key)
-        )
-        conn.commit()
-        conn.close()
+    # New airline-based validation path
+    if airline_url:
+        normalized_incoming_url = normalize_url(airline_url)
 
+        if not normalized_incoming_url:
+            conn.close()
+            return {
+                "valid": False,
+                "license_key": resolved_key,
+                "status": "invalid_airline_url"
+            }
+
+        if not saved_url:
+            cursor.execute(
+                "UPDATE licenses SET licensed_url = ? WHERE license_key = ?",
+                (normalized_incoming_url, resolved_key)
+            )
+            conn.commit()
+            conn.close()
+
+            return {
+                "valid": True,
+                "license_key": resolved_key,
+                "status": "active",
+                "airline_bound": True
+            }
+
+        if normalize_url(saved_url) != normalized_incoming_url:
+            conn.close()
+            return {
+                "valid": False,
+                "license_key": resolved_key,
+                "status": "airline_mismatch"
+            }
+
+        conn.close()
         return {
             "valid": True,
-            "license_key": key,
+            "license_key": resolved_key,
             "status": "active",
-            "device_bound": True
+            "airline_bound": False
         }
 
-    if saved_device_id != device_id:
+    # Legacy device-based validation path
+    if device_id:
+        if not saved_device_id:
+            cursor.execute(
+                "UPDATE licenses SET device_id = ? WHERE license_key = ?",
+                (device_id, resolved_key)
+            )
+            conn.commit()
+            conn.close()
+
+            return {
+                "valid": True,
+                "license_key": resolved_key,
+                "status": "active",
+                "device_bound": True
+            }
+
+        if saved_device_id != device_id:
+            conn.close()
+            return {
+                "valid": False,
+                "license_key": resolved_key,
+                "status": "device_mismatch"
+            }
+
         conn.close()
         return {
-            "valid": False,
-            "license_key": key,
-            "status": "device_mismatch"
+            "valid": True,
+            "license_key": resolved_key,
+            "status": "active",
+            "device_bound": False
         }
 
     conn.close()
-    return {
-        "valid": True,
-        "license_key": key,
-        "status": "active",
-        "device_bound": False
-    }
+    return {"valid": False, "status": "invalid_request"}
 
 
 @app.post("/admin/create_key")
 def create_key(
     key: str,
     status: str = "active",
+    licensed_url: str | None = None,
     x_admin_key: str | None = Header(default=None)
 ):
     require_admin_key(x_admin_key)
+
+    normalized_url = normalize_url(licensed_url) if licensed_url else None
 
     conn = get_db()
     cursor = conn.cursor()
 
     try:
         cursor.execute(
-            "INSERT INTO licenses (license_key, status, device_id) VALUES (?, ?, NULL)",
-            (key, status)
+            "INSERT INTO licenses (license_key, status, device_id, licensed_url) VALUES (?, ?, NULL, ?)",
+            (key, status, normalized_url)
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -141,13 +228,19 @@ def create_key(
     return {
         "created": True,
         "license_key": key,
-        "status": status
+        "status": status,
+        "licensed_url": normalized_url
     }
 
 
 @app.post("/admin/generate_key")
-def admin_generate_key(x_admin_key: str | None = Header(default=None)):
+def admin_generate_key(
+    licensed_url: str | None = None,
+    x_admin_key: str | None = Header(default=None)
+):
     require_admin_key(x_admin_key)
+
+    normalized_url = normalize_url(licensed_url) if licensed_url else None
 
     conn = get_db()
     cursor = conn.cursor()
@@ -156,15 +249,16 @@ def admin_generate_key(x_admin_key: str | None = Header(default=None)):
         key = generate_license_key()
         try:
             cursor.execute(
-                "INSERT INTO licenses (license_key, status, device_id) VALUES (?, 'active', NULL)",
-                (key,)
+                "INSERT INTO licenses (license_key, status, device_id, licensed_url) VALUES (?, 'active', NULL, ?)",
+                (key, normalized_url)
             )
             conn.commit()
             conn.close()
             return {
                 "created": True,
                 "license_key": key,
-                "status": "active"
+                "status": "active",
+                "licensed_url": normalized_url
             }
         except sqlite3.IntegrityError:
             continue
@@ -222,6 +316,32 @@ def reset_device(key: str, x_admin_key: str | None = Header(default=None)):
     }
 
 
+@app.post("/admin/reset_airline")
+def reset_airline(key: str, x_admin_key: str | None = Header(default=None)):
+    require_admin_key(x_admin_key)
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE licenses SET licensed_url = NULL WHERE license_key = ?",
+        (key,)
+    )
+
+    if cursor.rowcount == 0:
+        conn.close()
+        return {"reset": False, "reason": "not_found"}
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "reset": True,
+        "license_key": key,
+        "airline_bound": False
+    }
+
+
 @app.get("/admin/licenses")
 def list_licenses(x_admin_key: str | None = Header(default=None)):
     require_admin_key(x_admin_key)
@@ -229,7 +349,11 @@ def list_licenses(x_admin_key: str | None = Header(default=None)):
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, license_key, status, device_id FROM licenses ORDER BY id DESC")
+    cursor.execute("""
+        SELECT id, license_key, status, device_id, licensed_url
+        FROM licenses
+        ORDER BY id DESC
+    """)
     rows = cursor.fetchall()
 
     conn.close()
@@ -239,7 +363,9 @@ def list_licenses(x_admin_key: str | None = Header(default=None)):
             "id": row["id"],
             "license_key": row["license_key"],
             "status": row["status"],
-            "device_bound": row["device_id"] is not None
+            "device_bound": row["device_id"] is not None,
+            "licensed_url": row["licensed_url"],
+            "airline_bound": row["licensed_url"] is not None
         }
         for row in rows
     ]
