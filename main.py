@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 import sqlite3
 import os
 import secrets
@@ -86,16 +86,39 @@ def root():
 
 
 @app.post("/validate")
-def validate_key(
-    key: str | None = None,
-    device_id: str | None = None,
-    license_key: str | None = None,
-    airline_url: str | None = None
-):
+async def validate_key(request: Request):
     conn = get_db()
     cursor = conn.cursor()
 
-    resolved_key = (key or license_key or "").strip()
+    body = {}
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except:
+        body = {}
+
+    query = request.query_params
+
+    resolved_key = (
+        body.get("license_key")
+        or body.get("key")
+        or query.get("license_key")
+        or query.get("key")
+        or ""
+    ).strip()
+
+    device_id = (
+        body.get("device_id")
+        or query.get("device_id")
+        or ""
+    ).strip()
+
+    airline_url = (
+        body.get("airline_url")
+        or query.get("airline_url")
+        or ""
+    ).strip()
 
     if not resolved_key:
         conn.close()
@@ -120,7 +143,6 @@ def validate_key(
             "status": status
         }
 
-    # New airline-based validation path
     if airline_url:
         normalized_incoming_url = normalize_url(airline_url)
 
@@ -152,7 +174,9 @@ def validate_key(
             return {
                 "valid": False,
                 "license_key": resolved_key,
-                "status": "airline_mismatch"
+                "status": "airline_mismatch",
+                "expected_url": saved_url,
+                "received_url": normalized_incoming_url
             }
 
         conn.close()
@@ -163,7 +187,6 @@ def validate_key(
             "airline_bound": False
         }
 
-    # Legacy device-based validation path
     if device_id:
         if not saved_device_id:
             cursor.execute(
